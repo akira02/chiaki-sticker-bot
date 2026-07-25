@@ -711,6 +711,11 @@ func commitSingleticker(pos int, flCount *int, safeMode bool, sf *StickerFile, c
 
 		err = c.Bot().AddSticker(effectiveRecipient(c, sd), input, name)
 		if err == nil {
+			// Telegram applies a separate, per-set flood limit to rapid
+			// addStickerToSet calls independent of our overall API rate limit.
+			// Pace ourselves proactively instead of only backing off after
+			// already tripping it.
+			time.Sleep(150 * time.Millisecond)
 			return nil
 		}
 
