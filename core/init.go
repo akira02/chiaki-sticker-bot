@@ -19,6 +19,7 @@ import (
 	"github.com/go-co-op/gocron"
 	log "github.com/sirupsen/logrus"
 	"github.com/star-39/moe-sticker-bot/pkg/msbimport"
+	"golang.org/x/time/rate"
 	tele "gopkg.in/telebot.v3"
 )
 
@@ -258,13 +259,35 @@ func noStickerAvailableReason(err error) string {
 	return reason
 }
 
+// telegramAPILimiter caps our own outbound request rate comfortably below
+// Telegram's global ~30 req/s bot limit. Without this, many concurrent users
+// (search results, progress edits, uploads) can burst past that ceiling with
+// no single caller doing anything wrong, and Telegram responds with very
+// long (hours-long) 429 retry-after bans on the whole bot.
+var telegramAPILimiter = rate.NewLimiter(rate.Limit(25), 25)
+
 func telegramHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 
 	return &http.Client{
 		Timeout:   10 * time.Minute,
-		Transport: replayableBodyTransport{next: transport},
+		Transport: replayableBodyTransport{next: rateLimitedTransport{next: transport}},
 	}
+}
+
+type rateLimitedTransport struct {
+	next http.RoundTripper
+}
+
+func (t rateLimitedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// getUpdates is a long-poll heartbeat, not a flood-prone write call;
+	// delaying it would just delay message reception.
+	if method := req.URL.Path; !strings.HasSuffix(method, "/getUpdates") {
+		if err := telegramAPILimiter.Wait(req.Context()); err != nil {
+			return nil, err
+		}
+	}
+	return t.next.RoundTrip(req)
 }
 
 type replayableBodyTransport struct {

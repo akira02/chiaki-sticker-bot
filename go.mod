@@ -19,6 +19,7 @@ require (
 	github.com/go-sql-driver/mysql v1.8.1
 	github.com/panjf2000/ants/v2 v2.9.1
 	github.com/sirupsen/logrus v1.9.3
+	golang.org/x/time v0.5.0
 	gopkg.in/telebot.v3 v3.2.1
 	mvdan.cc/xurls/v2 v2.5.0
 )
