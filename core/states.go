@@ -578,7 +578,7 @@ func waitEmojiChoice(c tele.Context) error {
 
 			pText, teleMsg, _ := sendProcessStarted(ud, c, "preparing...")
 			setState(c, ST_PROCESSING)
-			if err := waitImportPreparation(ud, pText, teleMsg, c); err != nil {
+			if err := waitImportPreparation(ud, newProgressEditor(pText, teleMsg, c)); err != nil {
 				return err
 			}
 			ud.commitChans = make([]chan bool, len(ud.stickerData.stickers))
@@ -622,29 +622,20 @@ func waitEmojiChoice(c tele.Context) error {
 	return nil
 }
 
-func waitImportPreparation(ud *UserData, pText string, teleMsg *tele.Message, c tele.Context) error {
+func waitImportPreparation(ud *UserData, pe *progressEditor) error {
 	done := make(chan struct{})
 	go func() {
 		ud.wg.Wait()
 		close(done)
 	}()
 
-	// Poll fast so the download byte counter updates smoothly, but only push an
-	// edit when the text actually changed (or every 30s as a keep-alive), to stay
-	// well under Telegram's edit rate limit.
-	ticker := time.NewTicker(2 * time.Second)
+	// Poll fast so the download byte counter updates smoothly; the editor
+	// coalesces and de-duplicates the edits.
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
-	lastText := ""
-	lastSend := time.Time{}
 	editWaiting := func() {
-		text := importPreparationProgressText(ud)
-		if text == lastText && time.Since(lastSend) < 30*time.Second {
-			return
-		}
-		editProgressMsg(0, 0, text, pText, teleMsg, c)
-		lastText = text
-		lastSend = time.Now()
+		pe.set(importPreparationProgressText(ud))
 	}
 	editWaiting()
 

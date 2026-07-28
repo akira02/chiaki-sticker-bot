@@ -631,30 +631,39 @@ func editProgressMsg(cur int, total int, progressText string, originalText strin
 	}()
 
 	header := originalText[:strings.LastIndex(originalText, "<code>")]
-	prog := ""
+	prog := progressText
 
-	if progressText != "" {
-		prog = progressText
-		goto SEND
+	if prog == "" {
+		cur = cur + 1
+		if cur != 1 && cur != total &&
+			cur != int(float64(0.25)*float64(total)) &&
+			cur != int(float64(0.5)*float64(total)) &&
+			cur != int(float64(0.75)*float64(total)) {
+			return nil
+		}
+		prog = progressBarText(cur, total)
 	}
-	cur = cur + 1
-	if cur == 1 {
-		prog = fmt.Sprintf("<code>[=>                  ]\n       %d of %d</code>", cur, total)
-	} else if cur == int(float64(0.25)*float64(total)) {
-		prog = fmt.Sprintf("<code>[====>               ]\n       %d of %d</code>", cur, total)
-	} else if cur == int(float64(0.5)*float64(total)) {
-		prog = fmt.Sprintf("<code>[=========>          ]\n       %d of %d</code>", cur, total)
-	} else if cur == int(float64(0.75)*float64(total)) {
-		prog = fmt.Sprintf("<code>[==============>     ]\n       %d of %d</code>", cur, total)
-	} else if cur == total {
-		prog = fmt.Sprintf("<code>[====================]\n       %d of %d</code>", cur, total)
-	} else {
-		return nil
-	}
-SEND:
+
 	messageText := header + prog
-	c.Bot().Edit(teleMsg, messageText, tele.ModeHTML)
-	return nil
+	_, err := c.Bot().Edit(teleMsg, messageText, tele.ModeHTML)
+	return err
+}
+
+// progressBarText renders a 20-cell bar plus the exact count. cur is 1-based.
+func progressBarText(cur int, total int) string {
+	const cells = 20
+	filled := 0
+	if total > 0 {
+		filled = cur * cells / total
+	}
+	if filled > cells {
+		filled = cells
+	}
+	bar := strings.Repeat("=", filled)
+	if filled < cells {
+		bar += ">" + strings.Repeat(" ", cells-filled-1)
+	}
+	return fmt.Sprintf("<code>[%s]\n       %d of %d</code>", bar, cur, total)
 }
 
 func sendAskSToManage(c tele.Context) error {

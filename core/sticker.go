@@ -29,7 +29,10 @@ const maxCustomEmojiPerStickerSet = 200
 func submitStickerSetAuto(createSet bool, c tele.Context) error {
 	ud := udFromCtx(c)
 	pText, teleMsg, _ := sendProcessStarted(ud, c, "Waiting...")
-	if err := waitImportPreparation(ud, pText, teleMsg, c); err != nil {
+	// One editor for the whole submission so every phase shares a single throttle
+	// budget on the same message.
+	pe := newProgressEditor(pText, teleMsg, c)
+	if err := waitImportPreparation(ud, pe); err != nil {
 		return err
 	}
 	if err := sessionContextErr(ud); err != nil {
@@ -59,12 +62,11 @@ func submitStickerSetAuto(createSet bool, c tele.Context) error {
 	// path below would otherwise stay silent for minutes while animated stickers
 	// transcode, making the bot look stuck on "Preparing stickers".
 	convTotal := len(ud.stickerData.stickers)
-	lastConvProgressEdit := time.Time{}
 	for i, sf := range ud.stickerData.stickers {
 		if err := sessionContextErr(ud); err != nil {
 			return err
 		}
-		lastConvProgressEdit = waitStickerConversionProgress(sf, i, convTotal, lastConvProgressEdit, pText, teleMsg, c)
+		waitStickerConversionProgress(sf, i, convTotal, pe)
 	}
 
 	batches := splitStickerSetBatches(ud.stickerData.stickers, createSet, ssType)
@@ -75,7 +77,7 @@ func submitStickerSetAuto(createSet bool, c tele.Context) error {
 			name = stickerSetPartName(ssName, part+1)
 			title = stickerSetPartTitle(ssTitle, part+1, len(batches))
 		}
-		errors, err := commitStickerSetAutoBatch(ud, createSet, stickers, part*maxCustomEmojiPerStickerSet, c, name, title, ssType, pText, teleMsg, flCount)
+		errors, err := commitStickerSetAutoBatch(ud, createSet, stickers, part*maxCustomEmojiPerStickerSet, c, name, title, ssType, pe, flCount)
 		if err != nil {
 			return err
 		}
@@ -103,7 +105,7 @@ func submitStickerSetAuto(createSet bool, c tele.Context) error {
 			}
 		}
 	}
-	editProgressMsg(0, 0, "Success! /start", pText, teleMsg, c)
+	pe.setNow("Success! /start")
 	c.Send("If you like this bot, please give us a ⭐️\n如果你喜歡這個 Bot，請幫我們按個 ⭐️\nhttps://github.com/akira02/chiaki-sticker-bot")
 	for _, pack := range createdPacks {
 		sendSFromSS(c, pack.name, teleMsg)
@@ -163,10 +165,12 @@ func stickerSetPartTitle(title string, part int, total int) string {
 	return string(runes) + suffix
 }
 
-func commitStickerSetAutoBatch(ud *UserData, createSet bool, stickers []*StickerFile, offset int, c tele.Context, ssName string, ssTitle string, ssType string, pText string, teleMsg *tele.Message, flCount *int) (int, error) {
+func commitStickerSetAutoBatch(ud *UserData, createSet bool, stickers []*StickerFile, offset int, c tele.Context, ssName string, ssTitle string, ssType string, pe *progressEditor, flCount *int) (int, error) {
 	batchCreateSuccess := false
 	if createSet {
+		stopHeartbeat := startUploadHeartbeat(len(stickers), pe)
 		err := createStickerSetBatch(ud.ctx, stickers, c, ssName, ssTitle, ssType)
+		stopHeartbeat()
 		if err != nil {
 			log.Warnln("sticker.go: Error batch create:", sanitizeErrorText(err))
 			existingCount, exists := existingStickerSetCount(c, ssName)
@@ -198,7 +202,7 @@ func commitStickerSetAutoBatch(ud *UserData, createSet bool, stickers []*Sticker
 			continue
 		}
 
-		go editProgressMsg(offset+index, len(ud.stickerData.stickers), "", pText, teleMsg, c)
+		pe.set(progressBarText(offset+index+1, len(ud.stickerData.stickers)))
 		if err := commitSingleticker(offset+index, flCount, false, sf, c, ud.stickerData, ssName, ssType); err != nil {
 			log.Warnln("execAutoCommit: a sticker failed to add.", err)
 			sendOneStickerFailedToAdd(c, offset+index, err)
@@ -213,6 +217,28 @@ func commitStickerSetAutoBatch(ud *UserData, createSet bool, stickers []*Sticker
 	return errorCount, nil
 }
 
+// createStickerSetBatch uploads up to 50 files in a single API call and may retry
+// it, with no intermediate signal of its own. Without a heartbeat the message sits
+// on the last conversion count for minutes and reads as stuck.
+func startUploadHeartbeat(count int, pe *progressEditor) func() {
+	done := make(chan struct{})
+	go func() {
+		started := time.Now()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				pe.set(fmt.Sprintf("<code>Uploading to Telegram / 上傳中...\n       %d stickers, %s elapsed</code>",
+					count, time.Since(started).Truncate(time.Second)))
+			}
+		}
+	}()
+	return func() { close(done) }
+}
+
 func sessionContextErr(ud *UserData) error {
 	if ud == nil || ud.ctx == nil {
 		return nil
@@ -220,48 +246,31 @@ func sessionContextErr(ud *UserData) error {
 	return ud.ctx.Err()
 }
 
-func waitStickerConversionProgress(sf *StickerFile, index int, total int, lastEdit time.Time, pText string, teleMsg *tele.Message, c tele.Context) time.Time {
+func waitStickerConversionProgress(sf *StickerFile, index int, total int, pe *progressEditor) {
 	done := make(chan struct{})
 	go func() {
 		sf.wg.Wait()
 		close(done)
 	}()
 
-	firstNotice := time.NewTimer(3 * time.Second)
-	heartbeat := time.NewTicker(20 * time.Second)
-	defer firstNotice.Stop()
-	defer heartbeat.Stop()
-
-	edit := func(doneCount int, status string, force bool) {
-		now := time.Now()
-		if !force && now.Sub(lastEdit) < 3*time.Second {
-			return
-		}
-		prog := conversionProgressText(doneCount, total, status)
-		editProgressMsg(0, 0, prog, pText, teleMsg, c)
-		lastEdit = now
-	}
-
-	// Even with no per-sticker status, refresh the message so a slow first
-	// conversion doesn't leave the stale "Processing files" text on screen.
-	editStatus := func() {
-		edit(index, sf.conversionStatus.Message(), true)
-	}
+	// Tick faster than the edit throttle so per-sticker status changes (queue
+	// position, compression retries) are picked up as soon as the window opens.
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-done:
 			doneCount := index + 1
-			force := doneCount == total
-			// Always attempt an update; edit() throttles to ~once per 3s, so this
-			// stays well under Telegram's edit rate limit while showing the true
-			// running count instead of coarse 25% jumps.
-			edit(doneCount, "", force)
-			return lastEdit
-		case <-firstNotice.C:
-			editStatus()
-		case <-heartbeat.C:
-			editStatus()
+			if doneCount == total {
+				// Terminal count: must land, or the message keeps a stale number.
+				pe.setNow(conversionProgressText(doneCount, total, ""))
+			} else {
+				pe.set(conversionProgressText(doneCount, total, ""))
+			}
+			return
+		case <-ticker.C:
+			pe.set(conversionProgressText(index, total, sf.conversionStatus.Message()))
 		}
 	}
 }
