@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -53,24 +52,6 @@ const (
 	defaultImageMagickOOMMemoryLimit = "32MiB"
 	defaultImageMagickOOMMapLimit    = "64MiB"
 )
-
-// heavyConverterSemaphore serializes ffmpeg and rlottie (TGS→GIF) invocations
-// against each other. Both are memory-heavy on the 256MB Fly VM, so running them
-// concurrently — even though they're different binaries — can OOM the box.
-var (
-	heavyConverterSemaphore     chan struct{}
-	heavyConverterSemaphoreOnce sync.Once
-)
-
-func initHeavyConverterSemaphore() {
-	heavyConverterSemaphoreOnce.Do(func() {
-		concurrency := 1
-		if value, err := strconv.Atoi(os.Getenv("MSB_FFMPEG_CONCURRENCY")); err == nil && value > 0 {
-			concurrency = value
-		}
-		heavyConverterSemaphore = make(chan struct{}, concurrency)
-	})
-}
 
 func niceCommand(bin string, args ...string) *exec.Cmd {
 	return exec.Command("nice", append([]string{"-n", niceLevel, bin}, args...)...)
@@ -151,34 +132,6 @@ func convertCommandTimeout() time.Duration {
 	return timeout
 }
 
-func acquireLottieGIFSlot() func() {
-	initHeavyConverterSemaphore()
-	heavyConverterSemaphore <- struct{}{}
-	return func() {
-		<-heavyConverterSemaphore
-	}
-}
-
-func acquireFFmpegSlot() func() {
-	initHeavyConverterSemaphore()
-	heavyConverterSemaphore <- struct{}{}
-	return func() {
-		<-heavyConverterSemaphore
-	}
-}
-
-// ImageMagick (pixel cache) and ffmpeg (VP9) are both memory-heavy; serialize them
-// against each other so their peaks never sum past the 256MB VM. Safe to call here
-// because no acquireFFmpegSlot holder ever routes through runImageMagickConvert (the
-// webp pipe path execs ImageMagick directly).
-func acquireImageMagickSlot() func() {
-	initHeavyConverterSemaphore()
-	heavyConverterSemaphore <- struct{}{}
-	return func() {
-		<-heavyConverterSemaphore
-	}
-}
-
 func imageMagickResourceArgs() []string {
 	memoryLimit := os.Getenv("MSB_IM_MEMORY_LIMIT")
 	if memoryLimit == "" {
@@ -225,24 +178,44 @@ func imageMagickConvertArgs(lowMemory bool, args ...string) []string {
 	return fullArgs
 }
 
+// imRunOpts selects which converter queue an ImageMagick call waits in and where
+// its queue position is reported.
+type imRunOpts struct {
+	// heavy marks coalescing/frame-extracting work, which holds every frame in
+	// the pixel cache and must not run alongside ffmpeg.
+	heavy  bool
+	status *ConversionStatus
+}
+
 func runImageMagickConvertWithOOMRetry(ctx context.Context, timeout time.Duration, args ...string) ([]byte, error) {
-	out, err := runImageMagickConvert(ctx, timeout, false, args...)
+	return runImageMagickConvertOpts(ctx, timeout, imRunOpts{}, args...)
+}
+
+func runImageMagickConvertHeavyWithOOMRetry(ctx context.Context, timeout time.Duration, status *ConversionStatus, args ...string) ([]byte, error) {
+	return runImageMagickConvertOpts(ctx, timeout, imRunOpts{heavy: true, status: status}, args...)
+}
+
+func runImageMagickConvertOpts(ctx context.Context, timeout time.Duration, opts imRunOpts, args ...string) ([]byte, error) {
+	out, err := runImageMagickConvert(ctx, timeout, false, opts, args...)
 	if err == nil || !processWasKilled(err) || ctxErr(ctx) != nil || sameStringSlice(imageMagickResourceArgs(), imageMagickOOMResourceArgs()) {
 		return out, err
 	}
 
 	log.Warnf("ImageMagick was killed, retrying with lower resource limits: %s", strings.Join(imageMagickOOMResourceArgs(), " "))
-	return runImageMagickConvert(ctx, timeout, true, args...)
+	return runImageMagickConvert(ctx, timeout, true, opts, args...)
 }
 
-func runImageMagickConvert(ctx context.Context, timeout time.Duration, lowMemory bool, args ...string) ([]byte, error) {
+func runImageMagickConvert(ctx context.Context, timeout time.Duration, lowMemory bool, opts imRunOpts, args ...string) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
 	// Acquire the slot before starting the timeout so queue wait doesn't eat
 	// into the conversion budget.
-	releaseSlot := acquireImageMagickSlot()
+	releaseSlot, err := acquireImageMagickSlot(ctx, opts.status, opts.heavy)
+	if err != nil {
+		return nil, err
+	}
 	defer releaseSlot()
 
 	runCtx := ctx

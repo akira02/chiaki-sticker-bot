@@ -1,6 +1,7 @@
 package msbimport
 
 import (
+	"context"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
@@ -8,7 +9,10 @@ import (
 
 // Replaces tgs to gif.
 func RlottieToGIF(f string) (string, error) {
-	release := acquireLottieGIFSlot()
+	release, err := acquireLottieGIFSlot(context.Background(), nil)
+	if err != nil {
+		return "", err
+	}
 	defer release()
 
 	bin := "msb_rlottie.py"

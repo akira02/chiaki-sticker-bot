@@ -19,7 +19,7 @@ func IMToGif(f string) (string, error) {
 	// -coalesce ensures proper frame disposal before palette reduction.
 	args := []string{"WEBP:" + f, "-coalesce", pathOut}
 
-	out, err := runImageMagickConvertWithOOMRetry(context.Background(), convertCommandTimeout(), args...)
+	out, err := runImageMagickConvertHeavyWithOOMRetry(context.Background(), convertCommandTimeout(), nil, args...)
 	if err != nil {
 		log.Warnln("IMToGif ERROR:", string(out))
 		return "", err
@@ -38,7 +38,7 @@ func IMToApng(f string) (string, error) {
 	// Use "WEBP:" prefix so ImageMagick detects the format even without a file extension.
 	args := []string{"WEBP:" + f, pathOut}
 
-	out, err := runImageMagickConvertWithOOMRetry(context.Background(), convertCommandTimeout(), args...)
+	out, err := runImageMagickConvertHeavyWithOOMRetry(context.Background(), convertCommandTimeout(), nil, args...)
 	if err != nil {
 		log.Warnln("imToApng ERROR:", string(out))
 		return "", err

@@ -148,7 +148,7 @@ func webpToWebmViaPipeFastWithMaxDurationContext(ctx context.Context, f string, 
 			if err := ctx.Err(); err != nil {
 				return pathOut, err
 			}
-			err := webpToWebmViaPipeOnceWithMaxDurationContext(ctx, f, pathOut, scale, fps, rc, duration)
+			err := webpToWebmViaPipeOnceWithMaxDurationContext(ctx, f, pathOut, scale, fps, rc, duration, status)
 			if err != nil {
 				lastErr = err
 				log.Warnln("webpToWebmViaPipeFast: retrying with two-pass frame sequence fallback.")
@@ -195,21 +195,21 @@ func webpToWebmViaPipeOnce(f string, pathOut string, scale string, fps float64, 
 }
 
 func webpToWebmViaPipeOnceContext(ctx context.Context, f string, pathOut string, scale string, fps float64, rc webmRateControl) error {
-	return webpToWebmViaPipeOnceWithMaxDurationContext(ctx, f, pathOut, scale, fps, rc, telegramVideoMaxDurationArg)
+	return webpToWebmViaPipeOnceWithMaxDurationContext(ctx, f, pathOut, scale, fps, rc, telegramVideoMaxDurationArg, nil)
 }
 
-func webpToWebmViaPipeOnceWithMaxDurationContext(ctx context.Context, f string, pathOut string, scale string, fps float64, rc webmRateControl, maxDuration string) error {
-	err := webpToWebmViaPipeOnceWithMaxDurationAttempt(ctx, f, pathOut, scale, fps, rc, maxDuration, false)
+func webpToWebmViaPipeOnceWithMaxDurationContext(ctx context.Context, f string, pathOut string, scale string, fps float64, rc webmRateControl, maxDuration string, status *ConversionStatus) error {
+	err := webpToWebmViaPipeOnceWithMaxDurationAttempt(ctx, f, pathOut, scale, fps, rc, maxDuration, false, status)
 	if err == nil || !processWasKilled(err) || ctxErr(ctx) != nil || sameStringSlice(imageMagickResourceArgs(), imageMagickOOMResourceArgs()) {
 		return err
 	}
 
 	log.Warnln("webpToWebmViaPipeOnce: process killed, retrying with lower ImageMagick resource limits")
 	os.Remove(pathOut)
-	return webpToWebmViaPipeOnceWithMaxDurationAttempt(ctx, f, pathOut, scale, fps, rc, maxDuration, true)
+	return webpToWebmViaPipeOnceWithMaxDurationAttempt(ctx, f, pathOut, scale, fps, rc, maxDuration, true, status)
 }
 
-func webpToWebmViaPipeOnceWithMaxDurationAttempt(ctx context.Context, f string, pathOut string, scale string, fps float64, rc webmRateControl, maxDuration string, lowMemoryImageMagick bool) error {
+func webpToWebmViaPipeOnceWithMaxDurationAttempt(ctx context.Context, f string, pathOut string, scale string, fps float64, rc webmRateControl, maxDuration string, lowMemoryImageMagick bool, status *ConversionStatus) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -235,7 +235,10 @@ func webpToWebmViaPipeOnceWithMaxDurationAttempt(ctx context.Context, f string, 
 
 	// Acquire the slot before starting the timeout so queue wait doesn't eat
 	// into the encode budget.
-	releaseFFmpeg := acquireFFmpegSlot()
+	releaseFFmpeg, slotErr := acquireFFmpegSlot(ctx, status)
+	if slotErr != nil {
+		return slotErr
+	}
 	runCtx, cancel := context.WithTimeout(ctx, convertCommandTimeout())
 	defer cancel()
 
@@ -325,7 +328,7 @@ func webpToWebmViaFramesTwoPassWithMaxDurationContext(ctx context.Context, f str
 	}
 
 	imArgs := []string{"WEBP:" + f, "-coalesce", "-resize", size, framePattern}
-	imOut, err := runImageMagickConvertWithOOMRetry(ctx, imageMagickTimeout, imArgs...)
+	imOut, err := runImageMagickConvertHeavyWithOOMRetry(ctx, imageMagickTimeout, status, imArgs...)
 	if err != nil {
 		if ctx.Err() != nil {
 			return pathOut, ctx.Err()
@@ -355,7 +358,7 @@ func webpToWebmViaFramesTwoPassWithMaxDurationContext(ctx context.Context, f str
 			if err := ctx.Err(); err != nil {
 				return pathOut, err
 			}
-			out, err := encodeWebmFramesTwoPass(ctx, timedFramePattern, pathOut, scale, timing.outputFPS, frameDir, rc, duration)
+			out, err := encodeWebmFramesTwoPass(ctx, timedFramePattern, pathOut, scale, timing.outputFPS, frameDir, rc, duration, status)
 			if err != nil {
 				if ctx.Err() != nil {
 					return pathOut, ctx.Err()
@@ -502,7 +505,7 @@ func parseKBitrate(bitrate string) (int, bool) {
 	return kbps, true
 }
 
-func encodeWebmFramesTwoPass(ctx context.Context, framePattern string, pathOut string, scale string, fps float64, workDir string, rc webmRateControl, maxDuration string) (string, error) {
+func encodeWebmFramesTwoPass(ctx context.Context, framePattern string, pathOut string, scale string, fps float64, workDir string, rc webmRateControl, maxDuration string, status *ConversionStatus) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -527,7 +530,10 @@ func encodeWebmFramesTwoPass(ctx context.Context, framePattern string, pathOut s
 		"-to", maxDuration, "-an",
 	)
 
-	releaseFFmpeg := acquireFFmpegSlot()
+	releaseFFmpeg, slotErr := acquireFFmpegSlot(ctx, status)
+	if slotErr != nil {
+		return "", slotErr
+	}
 	defer releaseFFmpeg()
 
 	pass1Args := append([]string{}, baseArgs...)

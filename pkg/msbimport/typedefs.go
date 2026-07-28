@@ -53,8 +53,11 @@ type LineFile struct {
 }
 
 type ConversionStatus struct {
-	mu      sync.RWMutex
+	mu sync.RWMutex
+	// conversion retry/progress message, owned by the converter
 	message string
+	// slot queue notice, owned by converterQueue
+	queued string
 }
 
 func NewConversionStatus() *ConversionStatus {
@@ -74,12 +77,31 @@ func (s *ConversionStatus) Clear() {
 	s.Set("")
 }
 
+func (s *ConversionStatus) SetQueue(message string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queued = message
+}
+
+func (s *ConversionStatus) ClearQueue() {
+	s.SetQueue("")
+}
+
+// Message prefers the queue notice: while queued that is the true state, and
+// clearing it reveals the converter's own message (e.g. a compression retry)
+// again instead of losing it.
 func (s *ConversionStatus) Message() string {
 	if s == nil {
 		return ""
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.queued != "" {
+		return s.queued
+	}
 	return s.message
 }
 

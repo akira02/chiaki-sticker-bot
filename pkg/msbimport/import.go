@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"path/filepath"
 	"strings"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -85,13 +87,21 @@ func convertSToTGFormat(ctx context.Context, ld *LineData) {
 				s.Wg.Done()
 			}
 		} else {
+			// Info level: without this a stalled conversion leaves no trace at all
+			// in production logs, which run at info.
+			log.Infof("convert: static [%d/%d] start %s", i+1, len(ld.Files), filepath.Base(s.OriginalFile))
+			started := time.Now()
 			s.ConvertedFile, err = IMToWebpTGStaticContext(ctx, s.OriginalFile, s.ConvertToEmoji)
+			elapsed := time.Since(started).Truncate(time.Millisecond)
 			if err != nil {
 				if ctx.Err() != nil {
 					s.CError = ctx.Err()
 				} else {
 					s.CError = err
 				}
+				log.Warnf("convert: static [%d/%d] failed after %s: %v", i+1, len(ld.Files), elapsed, s.CError)
+			} else {
+				log.Infof("convert: static [%d/%d] done in %s", i+1, len(ld.Files), elapsed)
 			}
 			s.Wg.Done()
 		}

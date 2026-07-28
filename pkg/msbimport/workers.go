@@ -2,6 +2,8 @@ package msbimport
 
 import (
 	"context"
+	"path/filepath"
+	"time"
 
 	"github.com/panjf2000/ants/v2"
 	log "github.com/sirupsen/logrus"
@@ -27,9 +29,15 @@ func wConvertWebm(i interface{}) {
 		return
 	default:
 	}
+	// Info level: production logs run at info, so a stuck encode must be visible.
+	log.Infof("convert: webm start %s", filepath.Base(lf.OriginalFile))
+	started := time.Now()
 	lf.ConvertedFile, err = FFToWebmTGVideoContextWithStatus(ctx, lf.OriginalFile, lf.ConvertToEmoji, lf.Status)
+	elapsed := time.Since(started).Truncate(time.Millisecond)
 	if err != nil {
 		lf.CError = err
+		log.Warnf("convert: webm %s failed after %s: %v", filepath.Base(lf.OriginalFile), elapsed, err)
+		return
 	}
-	log.Debugln("convert OK: ", lf.ConvertedFile)
+	log.Infof("convert: webm done in %s -> %s", elapsed, filepath.Base(lf.ConvertedFile))
 }

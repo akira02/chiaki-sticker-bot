@@ -22,6 +22,13 @@ primary_region = 'sin'
   # throttled shared-core VM a single VP9 encode can legitimately exceed the
   # 120s default, which made every attempt time out and retry forever.
   MSB_CONVERT_TIMEOUT_SECONDS = "300"
+  # Upper bound on waiting for a converter slot. Without it, one wedged encode
+  # blocks every queued conversion forever with no error and nothing in the log.
+  MSB_CONVERT_QUEUE_TIMEOUT_SECONDS = "600"
+  # Static image conversions run in their own queue instead of waiting behind
+  # multi-minute VP9 encodes. Set MSB_IM_SHARE_HEAVY_SLOT=1 to serialize them with
+  # ffmpeg again if the extra concurrent ImageMagick ever costs too much memory.
+  MSB_IM_CONCURRENCY = "1"
   MSB_IM_MEMORY_LIMIT = "32MiB"
   MSB_IM_MAP_LIMIT = "64MiB"
   MSB_IM_OOM_MEMORY_LIMIT = "24MiB"
