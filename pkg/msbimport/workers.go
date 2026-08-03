@@ -5,16 +5,13 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/panjf2000/ants/v2"
 	log "github.com/sirupsen/logrus"
 )
 
-// Workers pool for converting webm
-var wpConvertWebm, _ = ants.NewPoolWithFunc(1, wConvertWebm)
-
-// Accepts *LineFile
-func wConvertWebm(i interface{}) {
-	lf := i.(*LineFile)
+// wConvertWebm runs one animated conversion. Expensive work is serialized by
+// heavyQueue inside the converter, which also reports its FIFO position. A
+// second worker pool here would create an unreported queue before heavyQueue.
+func wConvertWebm(lf *LineFile) {
 	defer lf.Wg.Done()
 	log.Debugln("Converting in pool for:", lf)
 

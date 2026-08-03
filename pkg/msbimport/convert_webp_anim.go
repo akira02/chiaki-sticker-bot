@@ -258,15 +258,30 @@ func webpToWebmViaPipeOnceWithMaxDurationAttempt(ctx context.Context, f string, 
 		return fmt.Errorf("webpToWebmViaPipeOnce: imCmd start: %w", err)
 	}
 	if err := ffCmd.Start(); err != nil {
+		// No ffmpeg reader exists, so unblock ImageMagick's pipe writer before
+		// reaping it. Otherwise it can become a zombie and keep this slot held.
+		_ = pr.Close()
+		_ = pw.Close()
+		_ = imCmd.Process.Kill()
+		_ = imCmd.Wait()
 		releaseFFmpeg()
-		imCmd.Process.Kill()
 		return fmt.Errorf("webpToWebmViaPipeOnce: ffCmd start: %w", err)
 	}
 	attachCPULimit(ffCmd.Process.Pid)
 
-	imErr := imCmd.Wait()
-	pw.Close()
+	// imCmd.Wait waits for the goroutine copying ImageMagick stdout into pw.
+	// If ffmpeg exits early, that copy blocks forever unless pr is closed first;
+	// the old sequential waits therefore left ffmpeg as a zombie and never
+	// released the heavy converter slot. Reap ffmpeg first, close its reader to
+	// unblock the writer, then wait for ImageMagick.
+	imDone := make(chan error, 1)
+	go func() {
+		imDone <- imCmd.Wait()
+		_ = pw.Close()
+	}()
 	ffErr := ffCmd.Wait()
+	_ = pr.Close()
+	imErr := <-imDone
 	releaseFFmpeg()
 
 	if err := ctx.Err(); err != nil {

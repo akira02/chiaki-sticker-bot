@@ -79,13 +79,11 @@ func convertSToTGFormat(ctx context.Context, ld *LineData) {
 		}
 		var err error
 		s.Ctx = ctx
-		// If lineS is animated, commit to worker pool
-		// since encoding vp9 is time and resource costy.
+		// Animated conversions enqueue themselves in the shared heavy converter
+		// queue. Do not put them behind a separate worker pool: its wait was
+		// invisible to users and incorrectly looked like active conversion.
 		if ld.IsAnimated {
-			if err := wpConvertWebm.Invoke(s); err != nil {
-				s.CError = err
-				s.Wg.Done()
-			}
+			go wConvertWebm(s)
 		} else {
 			// Info level: without this a stalled conversion leaves no trace at all
 			// in production logs, which run at info.
