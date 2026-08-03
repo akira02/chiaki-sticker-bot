@@ -26,8 +26,9 @@ primary_region = 'sin'
   # blocks every queued conversion forever with no error and nothing in the log.
   MSB_CONVERT_QUEUE_TIMEOUT_SECONDS = "600"
   # Static image conversions run in their own queue instead of waiting behind
-  # multi-minute VP9 encodes. Set MSB_IM_SHARE_HEAVY_SLOT=1 to serialize them with
-  # ffmpeg again if the extra concurrent ImageMagick ever costs too much memory.
+  # multi-minute VP9 encodes. The 256MB VM cannot safely run ImageMagick beside
+  # ffmpeg, so both share one heavy slot to prevent aggregate OOM kills.
+  MSB_IM_SHARE_HEAVY_SLOT = "1"
   MSB_IM_CONCURRENCY = "1"
   MSB_IM_MEMORY_LIMIT = "32MiB"
   MSB_IM_MAP_LIMIT = "64MiB"
