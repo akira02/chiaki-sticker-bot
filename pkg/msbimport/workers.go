@@ -8,12 +8,15 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// wConvertWebm runs one animated conversion. Expensive work is serialized by
-// heavyQueue inside the converter, which also reports its FIFO position. A
-// second worker pool here would create an unreported queue before heavyQueue.
+// webmWorkerQueue serializes animated conversion setup. Unlike the former ants
+// pool, it reports FIFO positions so work waiting before heavyQueue never looks
+// like it has already started converting.
+var webmWorkerQueue = &converterQueue{name: "webm conversion worker", capacity: 1}
+
+// wConvertWebm runs one animated conversion after its dispatch slot is granted.
+// The encoder itself remains separately serialized by heavyQueue.
 func wConvertWebm(lf *LineFile) {
 	defer lf.Wg.Done()
-	log.Debugln("Converting in pool for:", lf)
 
 	var err error
 	ctx := lf.Ctx
@@ -26,6 +29,13 @@ func wConvertWebm(lf *LineFile) {
 		return
 	default:
 	}
+	release, err := webmWorkerQueue.acquire(ctx, lf.Status)
+	if err != nil {
+		lf.CError = err
+		return
+	}
+	defer release()
+
 	// Info level: production logs run at info, so a stuck encode must be visible.
 	log.Infof("convert: webm start %s", filepath.Base(lf.OriginalFile))
 	started := time.Now()
