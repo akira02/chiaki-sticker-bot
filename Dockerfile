@@ -27,7 +27,8 @@ FROM debian:bookworm-slim AS ffmpeg-fetcher
 ARG FFMPEG_BUILD_TAG=autobuild-2026-08-04-21-26
 ARG FFMPEG_ASSET=ffmpeg-N-125954-g9862dd83b1-linux64-lgpl.tar.xz
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl xz-utils \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL -o /tmp/ffmpeg.tar.xz \
