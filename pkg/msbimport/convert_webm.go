@@ -37,10 +37,10 @@ func FFToWebmTGVideoContextWithStatus(ctx context.Context, f string, isCustomEmo
 		return "", err
 	}
 
-	// ffmpeg cannot decode animated WebP directly. Route those through the
-	// lower-memory WebP pipeline instead of materializing a large APNG first.
+	// Animated WebP gets its own encode path: a finer bitrate ladder and fps
+	// resampling for the variable frame delays these sources carry.
 	if !strings.HasSuffix(f, ".apng") && isAnimatedWebp(f) {
-		log.Debugln("FFToWebmTGVideo: animated WebP detected, using streaming/frame-sequence pipeline.")
+		log.Debugln("FFToWebmTGVideo: animated WebP detected, using the WebP encode path.")
 		return animatedWebpToWebmTGVideoContext(ctx, f, isCustomEmoji, status)
 	}
 
@@ -159,7 +159,7 @@ func FFToWebmSafeContext(ctx context.Context, f string, isCustomEmoji bool) (str
 		return "", err
 	}
 	if !strings.HasSuffix(f, ".apng") && isAnimatedWebp(f) {
-		log.Debugln("FFToWebmSafe: animated WebP detected, using safe streaming/frame-sequence pipeline.")
+		log.Debugln("FFToWebmSafe: animated WebP detected, using the safe WebP encode path.")
 		return animatedWebpToWebmTGVideoSafeContext(ctx, f, isCustomEmoji, nil)
 	}
 

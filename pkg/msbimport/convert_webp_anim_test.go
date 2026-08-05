@@ -2,7 +2,6 @@ package msbimport
 
 import (
 	"math"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -10,28 +9,43 @@ import (
 	"testing"
 )
 
-func TestParseWebpDelayTicks(t *testing.T) {
-	delays, ok := parseWebpDelayTicks("10\n100\n100\n")
-	if !ok {
-		t.Fatal("expected delay parsing to succeed")
+// The fps filter is what converts the WebP's variable ANMF frame delays into a
+// constant-rate stream. Dropping it would silently mistime every animated
+// sticker rather than fail, so pin it down.
+func TestWebmFromWebpBaseArgsResamplesToConstantRate(t *testing.T) {
+	rc := webmRateControl{bitrate: "610k", maxrate: "910k"}
+	args := webmFromWebpBaseArgs("in.webp", "512:512:force_original_aspect_ratio=decrease", rc, telegramVideoMaxDurationArg, false)
+
+	joined := strings.Join(args, " ")
+	wantFilter := "scale=512:512:force_original_aspect_ratio=decrease,fps=30"
+	if !strings.Contains(joined, wantFilter) {
+		t.Fatalf("filter chain missing %q: %v", wantFilter, args)
 	}
-	want := []float64{10, 100, 100}
-	if len(delays) != len(want) {
-		t.Fatalf("delay count = %d, want %d", len(delays), len(want))
+	// The WebP must be read directly; an image2pipe input would mean the
+	// ImageMagick frame-extraction detour is back.
+	if strings.Contains(joined, "image2pipe") {
+		t.Fatalf("expected direct WebP input, got: %v", args)
 	}
-	for i := range want {
-		if delays[i] != want[i] {
-			t.Fatalf("delay[%d] = %v, want %v", i, delays[i], want[i])
+	for _, want := range []string{"-pix_fmt yuva420p", "-i in.webp", "-to " + telegramVideoMaxDurationArg} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("args missing %q: %v", want, args)
 		}
+	}
+	if strings.Contains(joined, "-g ") {
+		t.Fatalf("single-pass encode should not set a keyframe interval: %v", args)
 	}
 }
 
-func TestParseWebpDelayTicksRejectsInvalidTiming(t *testing.T) {
-	if _, ok := parseWebpDelayTicks("10\n0\n100\n"); ok {
-		t.Fatal("expected zero delay to be rejected")
+func TestWebmFromWebpBaseArgsTwoPassSetsKeyframeInterval(t *testing.T) {
+	rc := webmRateControl{bitrate: "610k", maxrate: "910k"}
+	args := webmFromWebpBaseArgs("in.webp", "100:100", rc, telegramVideoSafeDurationArg, true)
+
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-g 30") {
+		t.Fatalf("two-pass encode should pin the keyframe interval to the output fps: %v", args)
 	}
-	if _, ok := parseWebpDelayTicks("10\nwat\n100\n"); ok {
-		t.Fatal("expected non-numeric delay to be rejected")
+	if !strings.Contains(joined, "-to "+telegramVideoSafeDurationArg) {
+		t.Fatalf("args missing safe duration: %v", args)
 	}
 }
 
@@ -78,68 +92,6 @@ func TestWebmDurationAttemptsOnlyShortens(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestNormalizeFrameDurationsPreservesVariableDelays(t *testing.T) {
-	durations := normalizeFrameDurations([]float64{10, 100, 100}, 3)
-	want := []float64{0.1, 1.0, 1.0}
-	if len(durations) != len(want) {
-		t.Fatalf("duration count = %d, want %d", len(durations), len(want))
-	}
-	for i := range want {
-		if math.Abs(durations[i]-want[i]) > 0.000001 {
-			t.Fatalf("duration[%d] = %v, want %v", i, durations[i], want[i])
-		}
-	}
-
-	total := 0.0
-	for _, duration := range durations {
-		total += duration
-	}
-	if math.Abs(total-2.1) > 0.000001 {
-		t.Fatalf("total duration = %v, want 2.1", total)
-	}
-}
-
-func TestAverageFPSFromDelayTicksUsesWholeAnimation(t *testing.T) {
-	got := averageFPSFromDelayTicks([]float64{10, 100, 100})
-	want := 3.0 * 100.0 / 210.0
-	if math.Abs(got-want) > 0.000001 {
-		t.Fatalf("fps = %v, want %v", got, want)
-	}
-}
-
-func TestMaterializeTimedFrameSequence(t *testing.T) {
-	dir := t.TempDir()
-	frames := []string{
-		filepath.Join(dir, "frame-00000.png"),
-		filepath.Join(dir, "frame-00001.png"),
-		filepath.Join(dir, "frame-00002.png"),
-	}
-	for _, frame := range frames {
-		if err := os.WriteFile(frame, []byte("png"), 0644); err != nil {
-			t.Fatalf("write frame fixture: %v", err)
-		}
-	}
-	durations := []float64{0.1, 1.0, 1.0}
-
-	pattern, count, err := materializeTimedFrameSequence(dir, frames, durations, kakaoWebmOutputFPS)
-	if err != nil {
-		t.Fatalf("materializeTimedFrameSequence returned error: %v", err)
-	}
-	if count != 63 {
-		t.Fatalf("timed frame count = %d, want 63", count)
-	}
-	if !strings.HasSuffix(pattern, filepath.Join("timed", "frame-%05d.png")) {
-		t.Fatalf("pattern = %q", pattern)
-	}
-	timedFrames, err := filepath.Glob(filepath.Join(dir, "timed", "frame-*.png"))
-	if err != nil {
-		t.Fatalf("glob timed frames: %v", err)
-	}
-	if len(timedFrames) != 63 {
-		t.Fatalf("timed files = %d, want 63", len(timedFrames))
 	}
 }
 
@@ -257,6 +209,7 @@ func TestKakaoAnimatedWebpToWebmPreservesVariableDelayDuration(t *testing.T) {
 			t.Skipf("%s not available: %v", bin, err)
 		}
 	}
+	requireAnimatedWebpSupport(t)
 
 	dir := t.TempDir()
 	red := filepath.Join(dir, "red.png")
@@ -278,15 +231,48 @@ func TestKakaoAnimatedWebpToWebmPreservesVariableDelayDuration(t *testing.T) {
 		t.Fatalf("create animated webp: %v\n%s", err, string(out))
 	}
 
+	// Derive the expectation from what ImageMagick actually wrote rather than
+	// from the -delay flags: IM versions disagree about how -delay maps onto
+	// frames, so a hardcoded duration makes this test flaky per environment.
+	sourceDuration := webpTicksDurationForTest(t, source)
+	want := math.Min(sourceDuration, telegramVideoMaxDuration)
+
 	webm, err := KakaoAnimatedWebpToWebm(source, NewConversionStatus())
 	if err != nil {
 		t.Fatalf("KakaoAnimatedWebpToWebm returned error: %v", err)
 	}
 
+	// Tolerance covers the fps filter quantising to 1/30s plus the demuxer
+	// deriving the final frame's duration rather than reading it.
 	duration := ffprobeDurationForTest(t, webm)
-	if duration < 2.0 || duration > 2.25 {
-		t.Fatalf("duration = %.3fs, want about 2.1s", duration)
+	if math.Abs(duration-want) > 0.15 {
+		t.Fatalf("duration = %.3fs, want %.3fs (source %.3fs)", duration, want, sourceDuration)
 	}
+}
+
+// webpTicksDurationForTest sums an animated WebP's frame delays via
+// ImageMagick, giving ground truth that does not depend on the ffmpeg build
+// under test.
+func webpTicksDurationForTest(t *testing.T, path string) float64 {
+	t.Helper()
+	args := append([]string{}, IDENTIFY_ARGS...)
+	args = append(args, "-format", "%T\n", "WEBP:"+path)
+	out, err := exec.Command(IDENTIFY_BIN, args...).Output()
+	if err != nil {
+		t.Fatalf("identify delays: %v", err)
+	}
+	ticks := 0.0
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		v, err := strconv.ParseFloat(strings.TrimSpace(line), 64)
+		if err != nil {
+			t.Fatalf("parse delay tick %q: %v", line, err)
+		}
+		ticks += v
+	}
+	if ticks <= 0 {
+		t.Fatalf("source has no frame delays")
+	}
+	return ticks / 100.0
 }
 
 func TestFFToWebmSafeAnimatedWebpUsesSafeDuration(t *testing.T) {
@@ -300,6 +286,7 @@ func TestFFToWebmSafeAnimatedWebpUsesSafeDuration(t *testing.T) {
 			t.Skipf("%s not available: %v", bin, err)
 		}
 	}
+	requireAnimatedWebpSupport(t)
 
 	dir := t.TempDir()
 	red := filepath.Join(dir, "red.png")
@@ -332,6 +319,20 @@ func TestFFToWebmSafeAnimatedWebpUsesSafeDuration(t *testing.T) {
 	duration := ffprobeDurationForTest(t, webm)
 	if duration > 2.95 {
 		t.Fatalf("duration = %.3fs, want safe duration below 2.95s", duration)
+	}
+}
+
+// requireAnimatedWebpSupport skips when ffmpeg predates the animated WebP
+// demuxer (FFmpeg 9.0). Older builds skip the ANMF chunks and decode nothing,
+// so these tests would report a toolchain gap as a conversion bug.
+func requireAnimatedWebpSupport(t *testing.T) {
+	t.Helper()
+	out, err := exec.Command(FFMPEG_BIN, "-hide_banner", "-demuxers").Output()
+	if err != nil {
+		t.Skipf("cannot list ffmpeg demuxers: %v", err)
+	}
+	if !strings.Contains(string(out), "webp_anim") {
+		t.Skip("ffmpeg lacks the webp_anim demuxer; needs FFmpeg 9.0+")
 	}
 }
 

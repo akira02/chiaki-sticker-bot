@@ -12,7 +12,6 @@ primary_region = 'sin'
   # Soft heap ceiling so Go returns memory to the OS promptly and leaves room for
   # the ~93MB VP9 ffmpeg subprocess + nginx within the 256MB VM (avoids OOM kills).
   GOMEMLIMIT = "128MiB"
-  MSB_KAKAO_FAST_PIPE = "1"
   # Cap each heavy encoder (ffmpeg) at this % of one core via cpulimit, leaving
   # headroom so the webhook/health handler stays responsive during conversions.
   # `nice` alone can't prevent fly's platform-level throttling of the whole VM.

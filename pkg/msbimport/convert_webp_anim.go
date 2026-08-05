@@ -1,14 +1,11 @@
 package msbimport
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -22,6 +19,8 @@ type webmRateControl struct {
 	maxrate string
 }
 
+// Output frame rate for animated WebP sources. The sources are variable-rate;
+// ffmpeg's fps filter resamples them to this constant rate.
 const kakaoWebmOutputFPS = 30.0
 
 var kakaoWebmRateControls = []webmRateControl{
@@ -67,78 +66,54 @@ var webmDurationFallbacks = []string{
 }
 
 // KakaoAnimatedWebpToWebm converts Kakao animated WebP stickers to Telegram
-// WebM. The default path writes PNG frames to disk, then runs two-pass VP9 so
-// fast-motion frames get better bit allocation under Telegram's 255KiB limit.
+// WebM.
 func KakaoAnimatedWebpToWebm(f string, status *ConversionStatus) (string, error) {
 	return KakaoAnimatedWebpToWebmContext(context.Background(), f, status)
 }
 
 func KakaoAnimatedWebpToWebmContext(ctx context.Context, f string, status *ConversionStatus) (string, error) {
-	if os.Getenv("MSB_KAKAO_FAST_PIPE") == "1" && webpHasConstantFrameDelay(f) {
-		return webpToWebmViaPipeFastContext(ctx, f, false, status)
-	}
-	return webpToWebmViaFramesTwoPassContext(ctx, f, false, status)
-}
-
-func webpToWebmViaPipeFast(f string, isCustomEmoji bool, status *ConversionStatus) (string, error) {
-	return webpToWebmViaPipeFastContext(context.Background(), f, isCustomEmoji, status)
+	return webpToWebmContext(ctx, f, false, status, telegramVideoMaxDurationArg, false)
 }
 
 func animatedWebpToWebmTGVideoContext(ctx context.Context, f string, isCustomEmoji bool, status *ConversionStatus) (string, error) {
 	return animatedWebpToWebmTGVideoWithMaxDurationContext(ctx, f, isCustomEmoji, status, telegramVideoMaxDurationArg)
 }
 
+// Safe mode handles sources that already exceed Telegram's duration limit, so
+// they always get trimmed. Two-pass spends the bit budget across the whole clip
+// instead of starving the tail.
 func animatedWebpToWebmTGVideoSafeContext(ctx context.Context, f string, isCustomEmoji bool, status *ConversionStatus) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return f + ".webm", err
-	}
-	log.Debugln("animatedWebpToWebmTGVideoSafeContext: using frame-sequence path for precise duration trimming.")
-	return webpToWebmViaFramesTwoPassWithMaxDurationContext(ctx, f, isCustomEmoji, status, telegramVideoSafeDurationArg)
+	return webpToWebmContext(ctx, f, isCustomEmoji, status, telegramVideoSafeDurationArg, true)
 }
 
 func animatedWebpToWebmTGVideoWithMaxDurationContext(ctx context.Context, f string, isCustomEmoji bool, status *ConversionStatus, maxDuration string) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return f + ".webm", err
-	}
-	if webpHasConstantFrameDelay(f) {
-		return webpToWebmViaPipeFastWithMaxDurationContext(ctx, f, isCustomEmoji, status, maxDuration)
-	}
-	log.Debugln("animatedWebpToWebmTGVideoContext: variable frame delays detected, using frame-sequence path.")
-	return webpToWebmViaFramesTwoPassWithMaxDurationContext(ctx, f, isCustomEmoji, status, maxDuration)
+	return webpToWebmContext(ctx, f, isCustomEmoji, status, maxDuration, false)
 }
 
-func webpToWebmViaPipeFastContext(ctx context.Context, f string, isCustomEmoji bool, status *ConversionStatus) (string, error) {
-	return webpToWebmViaPipeFastWithMaxDurationContext(ctx, f, isCustomEmoji, status, telegramVideoMaxDurationArg)
-}
-
-func webpToWebmViaPipeFastWithMaxDurationContext(ctx context.Context, f string, isCustomEmoji bool, status *ConversionStatus, maxDuration string) (string, error) {
+// webpToWebmContext encodes an animated WebP to Telegram-compliant WebM.
+//
+// ffmpeg reads the WebP directly: its webp_anim demuxer reports per-frame ANMF
+// durations, so the fps filter handles the variable frame timing that this code
+// used to reproduce by hand (extracting frames with ImageMagick and duplicating
+// them into a constant-rate sequence). Requires FFmpeg 9.0+; older builds skip
+// the ANMF chunks entirely and decode nothing.
+func webpToWebmContext(ctx context.Context, f string, isCustomEmoji bool, status *ConversionStatus, maxDuration string, twoPass bool) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	pathOut := f + ".webm"
-	status.Clear()
-
-	fps := 25.0
-	sourceDurationSec := 0.0
-	if delays, ok := webpDelayTicks(f); ok {
-		fps = averageFPSFromDelayTicks(delays)
-		for _, d := range delays {
-			sourceDurationSec += d
-		}
-		sourceDurationSec /= 100.0
+	if err := ctx.Err(); err != nil {
+		return pathOut, err
 	}
-	log.Debugf("webpToWebmViaPipeFast: %s fps=%.2f dur=%.2fs", f, fps, sourceDurationSec)
+	status.Clear()
 
 	scale := "512:512:force_original_aspect_ratio=decrease"
 	if isCustomEmoji {
 		scale = "100:100:force_original_aspect_ratio=decrease"
 	}
+
+	sourceDurationSec, _ := mediaDurationSeconds(f)
+	log.Debugf("webpToWebm: %s dur=%.2fs twoPass=%v", f, sourceDurationSec, twoPass)
 
 	var lastErr error
 	for _, duration := range webmDurationAttempts(maxDuration) {
@@ -148,248 +123,25 @@ func webpToWebmViaPipeFastWithMaxDurationContext(ctx context.Context, f string, 
 			if err := ctx.Err(); err != nil {
 				return pathOut, err
 			}
-			err := webpToWebmViaPipeOnceWithMaxDurationContext(ctx, f, pathOut, scale, fps, rc, duration, status)
-			if err != nil {
-				lastErr = err
-				log.Warnln("webpToWebmViaPipeFast: retrying with two-pass frame sequence fallback.")
-				os.Remove(pathOut)
-				if fallback, fallbackErr := webpToWebmViaFramesTwoPassWithMaxDurationContext(ctx, f, isCustomEmoji, status, duration); fallbackErr == nil {
-					return fallback, nil
-				} else {
-					log.Warnln("webpToWebmViaPipeFast fallback ERROR:", fallbackErr)
-				}
-				return pathOut, err
-			}
-			st, err := os.Stat(pathOut)
-			if err != nil || st.Size() == 0 {
-				lastErr = errors.New("webpToWebmViaPipeFast: output empty")
-				os.Remove(pathOut)
-				i++
-				continue
-			}
-			if st.Size() <= 255*KiB {
-				status.Clear()
-				return pathOut, nil
-			}
-			lastErr = fmt.Errorf("webpToWebmViaPipeFast: output too large: %d bytes", st.Size())
-			status.Set(stickerTooLargeStatus())
-			nextIndex := nextWebmRateControlIndexAfterOversize(kakaoWebmRateControls, i, st.Size())
-			nextBitrate := "shorter duration"
-			if nextIndex < len(kakaoWebmRateControls) {
-				nextBitrate = kakaoWebmRateControls[nextIndex].bitrate
-			}
-			log.Warnf("webpToWebmViaPipeFast: output too large at %s for %s, retrying at %s: %d bytes", rc.bitrate, duration, nextBitrate, st.Size())
-			os.Remove(pathOut)
-			i = nextIndex
-			continue
-		}
-	}
-	if lastErr != nil {
-		return pathOut, fmt.Errorf("%w: %v", ErrStickerTooLarge, lastErr)
-	}
-	return pathOut, errors.New("webpToWebmViaPipeFast: no encode attempts")
-}
 
-func webpToWebmViaPipeOnce(f string, pathOut string, scale string, fps float64, rc webmRateControl) error {
-	return webpToWebmViaPipeOnceContext(context.Background(), f, pathOut, scale, fps, rc)
-}
-
-func webpToWebmViaPipeOnceContext(ctx context.Context, f string, pathOut string, scale string, fps float64, rc webmRateControl) error {
-	return webpToWebmViaPipeOnceWithMaxDurationContext(ctx, f, pathOut, scale, fps, rc, telegramVideoMaxDurationArg, nil)
-}
-
-func webpToWebmViaPipeOnceWithMaxDurationContext(ctx context.Context, f string, pathOut string, scale string, fps float64, rc webmRateControl, maxDuration string, status *ConversionStatus) error {
-	err := webpToWebmViaPipeOnceWithMaxDurationAttempt(ctx, f, pathOut, scale, fps, rc, maxDuration, false, status)
-	if err == nil || !processWasKilled(err) || ctxErr(ctx) != nil || sameStringSlice(imageMagickResourceArgs(), imageMagickOOMResourceArgs()) {
-		return err
-	}
-
-	log.Warnln("webpToWebmViaPipeOnce: process killed, retrying with lower ImageMagick resource limits")
-	os.Remove(pathOut)
-	return webpToWebmViaPipeOnceWithMaxDurationAttempt(ctx, f, pathOut, scale, fps, rc, maxDuration, true, status)
-}
-
-func webpToWebmViaPipeOnceWithMaxDurationAttempt(ctx context.Context, f string, pathOut string, scale string, fps float64, rc webmRateControl, maxDuration string, lowMemoryImageMagick bool, status *ConversionStatus) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	ffArgs := append([]string{}, ffmpegQ...)
-	ffArgs = append(ffArgs,
-		"-f", "image2pipe", "-vcodec", "png",
-		"-framerate", fmt.Sprintf("%g", fps),
-		"-i", "pipe:0",
-		"-vf", "scale="+scale,
-		"-threads", "1", "-pix_fmt", "yuva420p", "-c:v", "libvpx-vp9",
-		"-cpu-used", "5", "-lag-in-frames", "0", "-tile-columns", "0", "-tile-rows", "0", "-auto-alt-ref", "0",
-	)
-	if rc.minrate != "" {
-		ffArgs = append(ffArgs, "-minrate", rc.minrate)
-	}
-	ffArgs = append(ffArgs, "-b:v", rc.bitrate)
-	if rc.maxrate != "" {
-		ffArgs = append(ffArgs, "-maxrate", rc.maxrate)
-	}
-	ffArgs = append(ffArgs, "-to", maxDuration, "-an", "-y", pathOut)
-
-	imArgs := imageMagickConvertArgs(lowMemoryImageMagick, "WEBP:"+f, "-coalesce", "png:-")
-
-	// Acquire the slot before starting the timeout so queue wait doesn't eat
-	// into the encode budget.
-	releaseFFmpeg, slotErr := acquireFFmpegSlot(ctx, status)
-	if slotErr != nil {
-		return slotErr
-	}
-	runCtx, cancel := context.WithTimeout(ctx, convertCommandTimeout())
-	defer cancel()
-
-	imCmd := exec.CommandContext(runCtx, CONVERT_BIN, imArgs...)
-	ffCmd := niceCommandContext(runCtx, FFMPEG_BIN, ffArgs...)
-
-	pr, pw := io.Pipe()
-	imCmd.Stdout = pw
-	var imOut bytes.Buffer
-	imCmd.Stderr = &imOut
-	var ffOut bytes.Buffer
-	ffCmd.Stdin = pr
-	ffCmd.Stderr = &ffOut
-
-	if err := imCmd.Start(); err != nil {
-		releaseFFmpeg()
-		return fmt.Errorf("webpToWebmViaPipeOnce: imCmd start: %w", err)
-	}
-	if err := ffCmd.Start(); err != nil {
-		// No ffmpeg reader exists, so unblock ImageMagick's pipe writer before
-		// reaping it. Otherwise it can become a zombie and keep this slot held.
-		_ = pr.Close()
-		_ = pw.Close()
-		_ = imCmd.Process.Kill()
-		_ = imCmd.Wait()
-		releaseFFmpeg()
-		return fmt.Errorf("webpToWebmViaPipeOnce: ffCmd start: %w", err)
-	}
-	attachCPULimit(ffCmd.Process.Pid)
-
-	// imCmd.Wait waits for the goroutine copying ImageMagick stdout into pw.
-	// If ffmpeg exits early, that copy blocks forever unless pr is closed first;
-	// the old sequential waits therefore left ffmpeg as a zombie and never
-	// released the heavy converter slot. Reap ffmpeg first, close its reader to
-	// unblock the writer, then wait for ImageMagick.
-	imDone := make(chan error, 1)
-	go func() {
-		imDone <- imCmd.Wait()
-		_ = pw.Close()
-	}()
-	ffErr := ffCmd.Wait()
-	_ = pr.Close()
-	imErr := <-imDone
-	releaseFFmpeg()
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if imErr != nil || ffErr != nil {
-		log.Warnln("webpToWebmViaPipeOnce ERROR ImageMagick:", imOut.String())
-		log.Warnln("webpToWebmViaPipeOnce ERROR ffmpeg:", ffOut.String())
-		if runCtx.Err() != nil {
-			return runCtx.Err()
-		}
-		if processWasKilled(ffErr) {
-			return ffErr
-		}
-		if processWasKilled(imErr) {
-			return imErr
-		}
-		if ffErr != nil {
-			return ffErr
-		}
-		return imErr
-	}
-	return nil
-}
-
-// webpToWebmViaFramesTwoPass trades temporary disk writes for lower memory and
-// better motion quality: ImageMagick exits before ffmpeg starts, then VP9
-// two-pass encoding allocates bits across the whole sticker.
-func webpToWebmViaFramesTwoPass(f string, isCustomEmoji bool, status *ConversionStatus) (string, error) {
-	return webpToWebmViaFramesTwoPassContext(context.Background(), f, isCustomEmoji, status)
-}
-
-func webpToWebmViaFramesTwoPassContext(ctx context.Context, f string, isCustomEmoji bool, status *ConversionStatus) (string, error) {
-	return webpToWebmViaFramesTwoPassWithMaxDurationContext(ctx, f, isCustomEmoji, status, telegramVideoMaxDurationArg)
-}
-
-func webpToWebmViaFramesTwoPassWithMaxDuration(f string, isCustomEmoji bool, status *ConversionStatus, maxDuration string) (string, error) {
-	return webpToWebmViaFramesTwoPassWithMaxDurationContext(context.Background(), f, isCustomEmoji, status, maxDuration)
-}
-
-func webpToWebmViaFramesTwoPassWithMaxDurationContext(ctx context.Context, f string, isCustomEmoji bool, status *ConversionStatus, maxDuration string) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	pathOut := f + ".webm"
-	status.Clear()
-	frameDir, err := os.MkdirTemp(filepath.Dir(f), filepath.Base(f)+".frames-*")
-	if err != nil {
-		return pathOut, err
-	}
-	defer os.RemoveAll(frameDir)
-
-	framePattern := filepath.Join(frameDir, "frame-%05d.png")
-	size := "512x512>"
-	scale := "512:512:force_original_aspect_ratio=decrease"
-	if isCustomEmoji {
-		size = "100x100>"
-		scale = "100:100:force_original_aspect_ratio=decrease"
-	}
-
-	imArgs := []string{"WEBP:" + f, "-coalesce", "-resize", size, framePattern}
-	imOut, err := runImageMagickConvertHeavyWithOOMRetry(ctx, imageMagickTimeout, status, imArgs...)
-	if err != nil {
-		if ctx.Err() != nil {
-			return pathOut, ctx.Err()
-		}
-		log.Warnln("webpToWebmViaFramesTwoPass ImageMagick ERROR:", string(imOut))
-		return pathOut, err
-	}
-	frames, err := filepath.Glob(filepath.Join(frameDir, "frame-*.png"))
-	if err != nil || len(frames) == 0 {
-		return pathOut, errors.New("webpToWebmViaFramesTwoPass: no frames produced")
-	}
-	timing := webpTimingForFrames(f, len(frames))
-	timedFramePattern, timedFrameCount, err := materializeTimedFrameSequence(frameDir, frames, timing.durations, timing.outputFPS)
-	if err != nil {
-		return pathOut, err
-	}
-	encodeDurationSec := 0.0
-	if timing.outputFPS > 0 {
-		encodeDurationSec = float64(timedFrameCount) / timing.outputFPS
-	}
-
-	var lastErr error
-	for _, duration := range webmDurationAttempts(maxDuration) {
-		effDur := effectiveEncodeDuration(encodeDurationSec, duration)
-		for i := estimatedWebmRateControlStartIndex(kakaoWebmRateControls, effDur); i < len(kakaoWebmRateControls); {
-			rc := kakaoWebmRateControls[i]
-			if err := ctx.Err(); err != nil {
-				return pathOut, err
-			}
-			out, err := encodeWebmFramesTwoPass(ctx, timedFramePattern, pathOut, scale, timing.outputFPS, frameDir, rc, duration, status)
+			out, err := encodeWebmFromWebp(ctx, f, pathOut, scale, rc, duration, twoPass, status)
 			if err != nil {
 				if ctx.Err() != nil {
 					return pathOut, ctx.Err()
 				}
 				if errors.Is(err, context.DeadlineExceeded) {
 					lastErr = fmt.Errorf("conversion timed out at %s for %s", rc.bitrate, duration)
-					log.Warnf("webpToWebmViaFramesTwoPass: %v, retrying with shorter duration", lastErr)
+					log.Warnf("webpToWebm: %v, retrying with shorter duration", lastErr)
 					os.Remove(pathOut)
 					break
 				}
-				log.Warnln("webpToWebmViaFramesTwoPass ffmpeg ERROR:", string(out))
+				log.Warnln("webpToWebm ffmpeg ERROR:", out)
 				return pathOut, err
 			}
+
 			st, err := os.Stat(pathOut)
 			if err != nil || st.Size() == 0 {
-				lastErr = errors.New("webpToWebmViaFramesTwoPass: output empty")
+				lastErr = errors.New("webpToWebm: output empty")
 				os.Remove(pathOut)
 				i++
 				continue
@@ -398,23 +150,99 @@ func webpToWebmViaFramesTwoPassWithMaxDurationContext(ctx context.Context, f str
 				status.Clear()
 				return pathOut, nil
 			}
-			lastErr = fmt.Errorf("webpToWebmViaFramesTwoPass: output too large: %d bytes", st.Size())
+
+			lastErr = fmt.Errorf("webpToWebm: output too large: %d bytes", st.Size())
 			status.Set(stickerTooLargeStatus())
 			nextIndex := nextWebmRateControlIndexAfterOversize(kakaoWebmRateControls, i, st.Size())
 			nextBitrate := "shorter duration"
 			if nextIndex < len(kakaoWebmRateControls) {
 				nextBitrate = kakaoWebmRateControls[nextIndex].bitrate
 			}
-			log.Warnf("webpToWebmViaFramesTwoPass: output too large at %s for %s, retrying at %s: %d bytes", rc.bitrate, duration, nextBitrate, st.Size())
+			log.Warnf("webpToWebm: output too large at %s for %s, retrying at %s: %d bytes", rc.bitrate, duration, nextBitrate, st.Size())
 			os.Remove(pathOut)
 			i = nextIndex
-			continue
 		}
 	}
 	if lastErr != nil {
 		return pathOut, fmt.Errorf("%w: %v", ErrStickerTooLarge, lastErr)
 	}
-	return pathOut, errors.New("webpToWebmViaFramesTwoPass: no encode attempts")
+	return pathOut, errors.New("webpToWebm: no encode attempts")
+}
+
+// encodeWebmFromWebp runs one VP9 encode attempt. Returns ffmpeg's output on
+// failure so the caller can log it.
+func encodeWebmFromWebp(ctx context.Context, f string, pathOut string, scale string, rc webmRateControl, maxDuration string, twoPass bool, status *ConversionStatus) (string, error) {
+	baseArgs := webmFromWebpBaseArgs(f, scale, rc, maxDuration, twoPass)
+
+	// Acquire the slot before starting the timeout so queue wait doesn't eat
+	// into the encode budget.
+	releaseFFmpeg, slotErr := acquireFFmpegSlot(ctx, status)
+	if slotErr != nil {
+		return "", slotErr
+	}
+	defer releaseFFmpeg()
+
+	if !twoPass {
+		args := append(append([]string{}, baseArgs...), "-y", pathOut)
+		return runWebmEncodePass(ctx, args)
+	}
+
+	passDir, err := os.MkdirTemp(filepath.Dir(f), filepath.Base(f)+".passlog-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(passDir)
+	passlog := filepath.Join(passDir, "vp9")
+
+	pass1 := append(append([]string{}, baseArgs...), "-pass", "1", "-passlogfile", passlog, "-f", "webm", "-y", os.DevNull)
+	if out, err := runWebmEncodePass(ctx, pass1); err != nil {
+		return out, err
+	}
+	pass2 := append(append([]string{}, baseArgs...), "-pass", "2", "-passlogfile", passlog, "-y", pathOut)
+	return runWebmEncodePass(ctx, pass2)
+}
+
+// webmFromWebpBaseArgs builds the ffmpeg arguments shared by every encode pass,
+// minus the output selection.
+func webmFromWebpBaseArgs(f string, scale string, rc webmRateControl, maxDuration string, twoPass bool) []string {
+	// -cpu-used: VP9 speed/quality tradeoff (0=slowest/best, 8=fastest). Two-pass
+	// already costs a second encode, so it buys quality back with a slower preset.
+	cpuUsed := "5"
+	if twoPass {
+		cpuUsed = "4"
+	}
+
+	args := append([]string{}, ffmpegQ...)
+	args = append(args,
+		"-i", f,
+		// scale before fps so only the source frames get resampled, not the
+		// duplicates the fps filter adds.
+		"-vf", fmt.Sprintf("scale=%s,fps=%g", scale, kakaoWebmOutputFPS),
+		"-threads", "1", "-pix_fmt", "yuva420p", "-c:v", "libvpx-vp9",
+		"-cpu-used", cpuUsed, "-lag-in-frames", "0", "-tile-columns", "0", "-tile-rows", "0", "-auto-alt-ref", "0",
+	)
+	if rc.minrate != "" {
+		args = append(args, "-minrate", rc.minrate)
+	}
+	args = append(args, "-b:v", rc.bitrate)
+	if rc.maxrate != "" {
+		args = append(args, "-maxrate", rc.maxrate)
+	}
+	if twoPass {
+		args = append(args, "-g", strconv.Itoa(int(kakaoWebmOutputFPS)))
+	}
+	return append(args, "-to", maxDuration, "-an")
+}
+
+func runWebmEncodePass(ctx context.Context, args []string) (string, error) {
+	runCtx, cancel := context.WithTimeout(ctx, convertCommandTimeout())
+	defer cancel()
+
+	out, err := niceLimitedCombinedOutput(runCtx, FFMPEG_BIN, args...)
+	if err != nil && runCtx.Err() != nil {
+		return string(out), runCtx.Err()
+	}
+	return string(out), err
 }
 
 func stickerTooLargeStatus() string {
@@ -520,65 +348,6 @@ func parseKBitrate(bitrate string) (int, bool) {
 	return kbps, true
 }
 
-func encodeWebmFramesTwoPass(ctx context.Context, framePattern string, pathOut string, scale string, fps float64, workDir string, rc webmRateControl, maxDuration string, status *ConversionStatus) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	keyframeInterval := int(fps + 0.5)
-	if keyframeInterval < 12 {
-		keyframeInterval = 12
-	}
-	if keyframeInterval > 30 {
-		keyframeInterval = 30
-	}
-
-	passlog := filepath.Join(workDir, "vp9-passlog")
-	baseArgs := append([]string{}, ffmpegQ...)
-	baseArgs = append(baseArgs,
-		"-framerate", fmt.Sprintf("%g", fps),
-		"-i", framePattern,
-		"-vf", "scale="+scale,
-		"-threads", "1", "-pix_fmt", "yuva420p", "-c:v", "libvpx-vp9",
-		"-cpu-used", "4", "-lag-in-frames", "0", "-tile-columns", "0", "-tile-rows", "0", "-auto-alt-ref", "0",
-		"-b:v", rc.bitrate, "-maxrate", rc.maxrate,
-		"-g", strconv.Itoa(keyframeInterval),
-		"-to", maxDuration, "-an",
-	)
-
-	releaseFFmpeg, slotErr := acquireFFmpegSlot(ctx, status)
-	if slotErr != nil {
-		return "", slotErr
-	}
-	defer releaseFFmpeg()
-
-	pass1Args := append([]string{}, baseArgs...)
-	pass1Args = append(pass1Args, "-pass", "1", "-passlogfile", passlog, "-f", "webm", "-y", os.DevNull)
-	runCtx, cancel := context.WithTimeout(ctx, convertCommandTimeout())
-	out, err := niceLimitedCombinedOutput(runCtx, FFMPEG_BIN, pass1Args...)
-	runErr := runCtx.Err()
-	cancel()
-	if err != nil {
-		if runErr != nil {
-			return string(out), runErr
-		}
-		return string(out), err
-	}
-
-	pass2Args := append([]string{}, baseArgs...)
-	pass2Args = append(pass2Args, "-pass", "2", "-passlogfile", passlog, "-y", pathOut)
-	runCtx, cancel = context.WithTimeout(ctx, convertCommandTimeout())
-	out, err = niceLimitedCombinedOutput(runCtx, FFMPEG_BIN, pass2Args...)
-	runErr = runCtx.Err()
-	cancel()
-	if err != nil {
-		if runErr != nil {
-			return string(out), runErr
-		}
-		return string(out), err
-	}
-	return "", nil
-}
-
 func webmDurationAttempts(maxDuration string) []string {
 	attempts := []string{}
 	seen := map[string]bool{}
@@ -602,194 +371,4 @@ func webmDurationAttempts(maxDuration string) []string {
 		add(maxDuration)
 	}
 	return attempts
-}
-
-type webpTiming struct {
-	durations []float64
-	outputFPS float64
-}
-
-func webpTimingForFrames(f string, frameCount int) webpTiming {
-	durations, ok := webpFrameDurations(f, frameCount)
-	if !ok {
-		fps := webpFPS(f)
-		if fps <= 0 {
-			fps = 25
-		}
-		durations = fallbackFrameDurations(frameCount, fps)
-	}
-	return webpTiming{
-		durations: durations,
-		outputFPS: kakaoWebmOutputFPS,
-	}
-}
-
-func materializeTimedFrameSequence(parentDir string, frames []string, durations []float64, fps float64) (string, int, error) {
-	if len(frames) == 0 {
-		return "", 0, errors.New("materializeTimedFrameSequence: no frames")
-	}
-	if len(frames) != len(durations) {
-		return "", 0, errors.New("materializeTimedFrameSequence: frame/duration count mismatch")
-	}
-	if fps <= 0 {
-		fps = kakaoWebmOutputFPS
-	}
-
-	timedDir := filepath.Join(parentDir, "timed")
-	if err := os.MkdirAll(timedDir, 0755); err != nil {
-		return "", 0, err
-	}
-
-	maxFrames := int(math.Ceil(telegramVideoMaxDuration * fps))
-	if maxFrames < 1 {
-		maxFrames = 1
-	}
-
-	outFrameCount := 0
-	for i, frame := range frames {
-		repeat := int(math.Round(durations[i] * fps))
-		if repeat < 1 {
-			repeat = 1
-		}
-		for j := 0; j < repeat && outFrameCount < maxFrames; j++ {
-			dst := filepath.Join(timedDir, fmt.Sprintf("frame-%05d.png", outFrameCount))
-			if err := linkOrCopyFrame(frame, dst); err != nil {
-				return "", 0, err
-			}
-			outFrameCount++
-		}
-		if outFrameCount >= maxFrames {
-			break
-		}
-	}
-	if outFrameCount == 0 {
-		return "", 0, errors.New("materializeTimedFrameSequence: no timed frames produced")
-	}
-
-	return filepath.Join(timedDir, "frame-%05d.png"), outFrameCount, nil
-}
-
-func linkOrCopyFrame(src string, dst string) error {
-	if err := os.Link(src, dst); err == nil {
-		return nil
-	}
-
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Close()
-}
-
-func webpFrameDurations(f string, frameCount int) ([]float64, bool) {
-	delays, ok := webpDelayTicks(f)
-	if !ok {
-		return nil, false
-	}
-	return normalizeFrameDurations(delays, frameCount), true
-}
-
-func normalizeFrameDurations(delayTicks []float64, frameCount int) []float64 {
-	if frameCount <= 0 {
-		return nil
-	}
-	if len(delayTicks) == 0 {
-		return fallbackFrameDurations(frameCount, 25)
-	}
-
-	durations := make([]float64, frameCount)
-	for i := 0; i < frameCount; i++ {
-		delayIndex := i
-		if delayIndex >= len(delayTicks) {
-			delayIndex = len(delayTicks) - 1
-		}
-		durations[i] = delayTicks[delayIndex] / 100.0
-	}
-	return durations
-}
-
-func fallbackFrameDurations(frameCount int, fps float64) []float64 {
-	if fps <= 0 {
-		fps = 25
-	}
-	durations := make([]float64, frameCount)
-	duration := 1.0 / fps
-	for i := range durations {
-		durations[i] = duration
-	}
-	return durations
-}
-
-// webpFPS returns the average playback FPS of an animated WebP from all frame
-// delays reported by ImageMagick. Falls back to 25 if unknown.
-func webpFPS(f string) float64 {
-	delays, ok := webpDelayTicks(f)
-	if !ok {
-		return 25
-	}
-	return averageFPSFromDelayTicks(delays)
-}
-
-func averageFPSFromDelayTicks(delays []float64) float64 {
-	totalTicks := 0.0
-	for _, delay := range delays {
-		totalTicks += delay
-	}
-	if totalTicks <= 0 {
-		return 25
-	}
-	return float64(len(delays)) * 100.0 / totalTicks
-}
-
-func webpDelayTicks(f string) ([]float64, bool) {
-	out, err := commandOutputWithTimeout(IDENTIFY_BIN,
-		append(IDENTIFY_ARGS, "-format", "%T\n", "WEBP:"+f)...,
-	)
-	if err != nil || len(out) == 0 {
-		return nil, false
-	}
-	return parseWebpDelayTicks(string(out))
-}
-
-func parseWebpDelayTicks(out string) ([]float64, bool) {
-	var delays []float64
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		delay, err := strconv.ParseFloat(strings.TrimSpace(line), 64)
-		if err != nil || delay <= 0 {
-			return nil, false
-		}
-		delays = append(delays, delay)
-	}
-	if len(delays) == 0 {
-		return nil, false
-	}
-	return delays, true
-}
-
-func webpHasConstantFrameDelay(f string) bool {
-	delays, ok := webpDelayTicks(f)
-	if !ok {
-		return false
-	}
-	if len(delays) < 2 {
-		return true
-	}
-	first := delays[0]
-	for _, delay := range delays[1:] {
-		if math.Abs(delay-first) > 0.001 {
-			return false
-		}
-	}
-	return true
 }

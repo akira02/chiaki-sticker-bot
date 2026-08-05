@@ -36,10 +36,13 @@ func TestMP4ToWebmVideoSticker(t *testing.T) {
 
 	dir := t.TempDir()
 	source := filepath.Join(dir, "source.mp4")
+	// mpeg4 rather than libx264: the runtime ffmpeg is an LGPL build with no
+	// libx264. Only H.264 *encoding* is missing, which nothing here needs -- the
+	// h264 decoder that real user uploads rely on is always built in.
 	cmd := exec.Command(FFMPEG_BIN,
 		"-hide_banner", "-loglevel", "error",
 		"-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10",
-		"-t", "1", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", source,
+		"-t", "1", "-an", "-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-y", source,
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("create MP4 fixture: %v\n%s", err, out)
