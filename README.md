@@ -24,7 +24,41 @@ A self-hosted Telegram sticker bot, forked from [@moe_sticker_bot](https://githu
 
 ---
 
-## Deployment on fly.io
+## Deployment
+
+### Docker / Docker Compose
+
+The included `Dockerfile` contains all build and runtime dependencies. It runs
+the bot, the WebApp, and nginx on port `8080`; persistent bot data lives in
+`/data`.
+
+```bash
+# 1. Configure the bot
+cp .env.example .env
+# Edit .env and set at least BOT_TOKEN.
+
+# 2. Build and start it
+docker compose up -d --build
+```
+
+For webhook mode, put the container behind a reverse proxy that serves HTTPS
+and set `WEBHOOK_URL` to its public `https://.../webhook` URL. Set `WEBAPP_URL`
+to the corresponding public `https://.../webapp` URL only if the WebApp should
+be enabled. Leaving `WEBHOOK_URL` unset uses Telegram long polling instead.
+
+To run without Compose:
+
+```bash
+docker build -t moe-sticker-bot .
+docker run -d --name moe-sticker-bot \
+  -p 8080:8080 \
+  --env-file .env \
+  -v moe-sticker-bot-data:/data \
+  --restart unless-stopped \
+  moe-sticker-bot
+```
+
+### Fly.io
 
 This fork is designed to run on [fly.io](https://fly.io) with 256MB RAM.
 
@@ -71,6 +105,10 @@ The built-in defaults are:
 * `MSB_KAKAO_FAST_PIPE` — set to `1` to use the faster one-pass Kakao animated WebP pipe path. Default is off; the default two-pass frame-sequence path is slower but gives better motion quality under Telegram's 255KiB video sticker limit.
 
 The checked-in Fly config pins `MSB_IM_MEMORY_LIMIT=32MiB` and `MSB_IM_MAP_LIMIT=64MiB` on the 256MB VM, with a one-shot OOM retry at `24MiB` / `48MiB`.
+It also sets `GOMEMLIMIT=128MiB`, limits heavy encoders to 70% of one CPU, and
+uses five-minute conversion timeouts. These values are Fly.io-specific tuning,
+not Docker requirements; adjust them for the memory and CPU available to your
+own host.
 
 
 ### Optional: Enable database (for /search and usage tracking)
@@ -88,7 +126,9 @@ fly secrets set \
 
 ### Optional: Enable WebApp (/manage with visual editor)
 
-Set `--webapp_url` and `--webapp_data_dir` in `start-bot.sh`, then deploy. The WebApp API is served on the same `:8080` port as the webhook.
+Set `WEBAPP_URL` to the public HTTPS URL of `/webapp`. The WebApp API is served
+on the same `:8080` port as the webhook, and its data is stored in
+`/data/webapp` by default.
 
 ---
 

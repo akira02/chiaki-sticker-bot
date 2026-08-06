@@ -1,0 +1,13 @@
+services:
+  moe-sticker-bot:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - moe-sticker-bot-data:/data
+    restart: unless-stopped
+
+volumes:
+  moe-sticker-bot-data:
